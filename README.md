@@ -8,9 +8,9 @@
 
 ## Problem Statement
 
-Large language models (LLMs) require caching of key and value tensors for autoregressive inference. These caches can exceed available GPU memory, especially on older Pascal GPUs (max 12–24 GB VRAM). Quantizing the KV cache to 4 bits reduces memory 8×, but **naive implementations on Pascal are often 10–20× slower than FP32** because the hardware lacks native low-precision arithmetic. This repository provides a custom CUDA kernel that overcomes this slowdown by grouping 8 quantized values into a single 32‑bit word and applying efficient vectorized dequantization.
+Large language models (LLMs) require caching of key and value tensors for autoregressive inference. These caches can exceed available GPU memory, especially on older Pascal GPUs (max 12–24 GB VRAM). Quantizing the KV cache to 4 bits reduces memory up to 8× for the packed data itself, but **naive implementations on Pascal are often 10–20× slower than FP32** because the hardware lacks native low-precision arithmetic. This repository provides a custom CUDA kernel that overcomes this slowdown by grouping 8 quantized values into a single 32‑bit word and applying efficient vectorized dequantization.
 
-With this approach, Q4 cache inference can approach FP32 speed while using only **1/8th the memory**.
+With this approach, Q4 cache inference can approach FP32 speed while using significantly less memory—**1/8th for the packed values**, plus a small metadata overhead (scales and zero-points).
 
 ---
 
@@ -27,17 +27,18 @@ Pascal GPUs execute only FP32 (and some integer) operations natively. When using
 
 ### Grouped Quantization (Sets of 8)
 
-We quantize values in **groups of 8 consecutive elements** and store them as a single 32‑bit word (little‑endian nibble order). Each group has **one shared float scale** and **one shared float zero‑point**.
+We quantize values in **groups of 8 consecutive elements** and store them as a single 32‑bit word (little‑endian nibble order). Each group has **one shared float scale** and **one shared float offset** (which we call `zero`, representing the minimum value of the group).
 
 **Advantages**:
 
-- **Vectorized memory access** – One `uint32_t` load per 8 values, coalesced across threads.
+- **Vectorized memory access** – One `uint32_t` load per 8 values, and with the proper data layout, loads are coalesced across threads.
 - **Efficient unpacking** – All 8 nibbles are extracted simultaneously using bitwise operations.
-- **Reduced metadata** – Scales/zeros add only 1/8th the data of the original FP32 tensor.
+- **Reduced metadata** – Scales/offsets add only 1/8th the data of the original FP32 tensor.
 - **Amortized overhead** – The conversion cost is spread over 8 multiply‑adds, making the kernel memory‑bound for typical head dimensions (≥64).
 
 The dequantization formula is:  
-`value_i = (nibble_i - zero) * scale`
+`value_i = nibble_i * scale + zero`  
+where `zero` is the group minimum (mapped to 0 during quantization).
 
 ---
 
@@ -47,30 +48,38 @@ The core kernel (`q4_dot_product_kernel`) computes dot products between a single
 
 ### Key Features
 
-- **Coalesced global memory access** – consecutive threads read consecutive 32‑bit words.
+- **Coalesced global memory access** – data is stored group‑major, so consecutive threads read consecutive 32‑bit words.
 - **Unrolled inner loop** – 8 FP32 fused multiply‑adds per group.
 - **Read‑only cache usage** – `__restrict__` hints enable texture cache optimizations.
+- **Correct dequantization** – values are reconstructed as `q * scale + zero`.
 
 ### Data Layout
 
-Assume key shape `[num_keys, head_dim]` with `head_dim` divisible by 8.
+Assume key shape `[num_keys, head_dim]` with `head_dim` divisible by 8. Let `groups_per_key = head_dim / 8`.
 
-- `q4_keys` : `uint32_t` array of size `num_keys * (head_dim / 8)`, each word packs 8 nibbles.
-- `scales`  : `float` array, one scale per group.
-- `zeros`   : `float` array, one zero‑point per group.
+Arrays are stored in **group‑major order** to guarantee coalesced memory access:
 
-All arrays are stored row‑major (key index first, then group index).
+- `q4_keys` : `uint32_t` array of size `num_keys * groups_per_key`. For key `k` and group `g`, the index is `g * num_keys + k`.
+- `scales`  : `float` array, same indexing; one scale per group.
+- `zeros`   : `float` array, same indexing; one offset per group (group minimum).
+
+This layout ensures that for a fixed group `g`, threads with consecutive `k` access consecutive memory addresses.
 
 ---
 
 ## Performance Expectations
 
-On a **GTX 1080 Ti** (11 GB, 484 GB/s bandwidth), processing a 24k token context with `head_dim = 128`:
+On a **GTX 1080 Ti** (11 GB, 484 GB/s bandwidth), processing a 24k token context with `head_dim = 128` (i.e., `groups_per_key = 16`):
 
-- **Q4 cache memory**: ~1.5 MB for keys + ~3 MB for metadata → negligible vs FP32 (384 MB).
-- **Kernel runtime**: Memory‑bound, estimated <5 ms (vs several minutes with naive Q4, ~5 minutes with FP32).
+- **Packed Q4 keys**: 24,576 keys × 16 groups × 4 bytes = **1.57 MB**  
+- **Scales**: same = **1.57 MB**  
+- **Zeros**: same = **1.57 MB**  
+- **Total Q4 data**: ~4.7 MB  
+- **Equivalent FP32 keys**: 24,576 × 128 × 4 = **12.58 MB**  
 
-Actual speedup depends on workload and GPU model.
+The kernel reads ~4.7 MB per query. At peak bandwidth, that takes about **0.01 ms**. Including launch overhead and minor inefficiencies, the kernel should run in **tens of microseconds to a few milliseconds**, depending on context size and GPU model. This is far faster than naive per‑element Q4 implementations (which can be 10–20× slower than FP32) and comparable to FP32 performance for memory‑bound workloads.
+
+Actual speedup depends on workload and GPU model. The memory savings are ~2.7× compared to FP32 when including metadata, but the packed data alone uses 8× less memory—crucial for large contexts.
 
 ---
 
@@ -96,7 +105,7 @@ Actual speedup depends on workload and GPU model.
 
 ### 1. Introduction
 
-Pascal-generation GPUs (GTX 10-series, P40, P100) lack hardware acceleration for low-precision arithmetic (FP16, INT8, INT4). Their CUDA cores are optimised for FP32 operations. When running inference with quantised KV caches (e.g., 4-bit), naive implementations often become **10–20× slower** than FP32, negating the memory savings. However, the slowdown is not due to a fundamental hardware limitation but rather to inefficient dequantization and memory access patterns. By grouping Q4 values into sets of eight (one 32-bit word) and using custom CUDA kernels, we can achieve near-FP32 performance while using only **1/8th the memory**.
+Pascal-generation GPUs (GTX 10-series, P40, P100) lack hardware acceleration for low-precision arithmetic (FP16, INT8, INT4). Their CUDA cores are optimised for FP32 operations. When running inference with quantised KV caches (e.g., 4-bit), naive implementations often become **10–20× slower** than FP32, negating the memory savings. However, the slowdown is not due to a fundamental hardware limitation but rather to inefficient dequantization and memory access patterns. By grouping Q4 values into sets of eight (one 32-bit word) and using custom CUDA kernels with a coalesced memory layout, we can achieve near-FP32 performance while using significantly less memory.
 
 This report explains the theoretical basis and provides a fully functional CUDA kernel that computes attention scores between a single FP32 query vector and a Q4-quantised key cache using grouped dequantization.
 
@@ -113,40 +122,40 @@ This report explains the theoretical basis and provides a fully functional CUDA 
 
 - **Naive Q4 KV cache**  
   - Memory: 0.5 bytes per value (packed).  
-  - Compute: Each value must be **unpacked** (extract nibble), **dequantised** (subtract zero, multiply by scale), then converted to FP32 before the dot product.  
+  - Compute: Each value must be **unpacked** (extract nibble), **dequantised** (scale and offset), then converted to FP32 before the dot product.  
   - If implemented with scalar loads and per‑element operations, the instruction overhead is enormous, making the kernel **compute‑bound** despite the reduced memory traffic.
 
 - **Root causes of slowdown**  
   1. **Unpacking overhead**: Extracting a 4-bit nibble from a byte, masking, shifting.  
   2. **Poor memory coalescing**: Reading individual bytes instead of 32-bit words.  
-  3. **Per‑element scale/zero load**: If scales and zeros are stored per value, the metadata traffic doubles memory usage.  
+  3. **Per‑element scale/offset load**: If scales and offsets are stored per value, the metadata traffic doubles memory usage.  
   4. **Kernel launch overhead**: High-level frameworks may use multiple kernels (unpack → scale → matmul) causing multiple passes over data.
 
 #### 2.2 Grouped Q4 (Sets of 8)
 
 Quantise values in **groups of 8 consecutive elements**. For each group:
 
-- Store **one scale** (float) and **one zero-point** (float).  
+- Store **one scale** (float) and **one offset** (float, group minimum, called `zero`).  
 - Pack the 8 four‑bit values into a single **32‑bit word** (little‑endian nibble order).  
 
 **Benefits**:
 
-- **Vectorised loads**: One `uint32_t` load per 8 values (coalesced across threads).  
+- **Vectorised loads**: One `uint32_t` load per 8 values. With group‑major layout, loads are coalesced across threads.  
 - **Efficient unpacking**: Use bitwise AND and shifts to extract all 8 nibbles in a few instructions.  
-- **Reduced metadata**: Scales/zeros add only 1/8th the data of the original FP32 tensor (or 1/4th if stored as half).  
+- **Reduced metadata**: Scales/offsets add only 1/8th the data of the original FP32 tensor.  
 - **Better arithmetic intensity**: The overhead per group is amortised over 8 multiply‑adds. If the head dimension is large (e.g., 128), the conversion cost becomes negligible compared to the actual dot product.
 
 Mathematically, the dequantised value for the *i*‑th element in a group is:
 
 ```
-value = (nibble_i - zero) * scale
+value_i = nibble_i * scale + zero
 ```
 
 The dot product between a query slice `q` and the dequantised group `k` becomes:
 
 ```
-sum_{i=0}^{7} q_i * (nibble_i - zero) * scale
-     = scale * ( sum_{i=0}^{7} q_i * nibble_i - zero * sum_{i=0}^{7} q_i )
+sum_{i=0}^{7} q_i * (nibble_i * scale + zero)
+     = scale * sum_{i=0}^{7} q_i * nibble_i + zero * sum_{i=0}^{7} q_i
 ```
 
 This can be further optimised, but the straightforward per‑element dequantisation is often fast enough because the FP32 multiply‑adds dominate.
@@ -155,13 +164,13 @@ This can be further optimised, but the straightforward per‑element dequantisat
 
 ### 3. Data Layout
 
-Assume the key cache has shape `[num_keys, head_dim]`, where `head_dim` is a multiple of 8. For grouped Q4:
+Assume the key cache has shape `[num_keys, head_dim]`, where `head_dim` is a multiple of 8. Let `groups_per_key = head_dim / 8`. Arrays are stored in **group‑major order**:
 
-- **`q4_keys`**: `uint32_t` array of size `num_keys * (head_dim / 8)`. Each word packs 8 nibbles.  
-- **`scales`**: `float` array of size `num_keys * (head_dim / 8)`. One scale per group.  
-- **`zeros`**: `float` array same size as `scales`. One zero‑point per group.
+- **`q4_keys`**: `uint32_t` array of size `num_keys * groups_per_key`. For key `k` (0 ≤ k < num_keys) and group `g` (0 ≤ g < groups_per_key), the packed word is at index `g * num_keys + k`.
+- **`scales`**: `float` array of same size; one scale per group.
+- **`zeros`**: `float` array of same size; one offset (group minimum) per group.
 
-The layout is row‑major: for key index `k`, the groups for its head dimension are stored consecutively.
+This layout ensures that for a fixed `g`, consecutive `k` access consecutive memory addresses, enabling perfect coalescing in the kernel.
 
 ---
 
@@ -174,16 +183,15 @@ We present a kernel that computes the dot product of **one FP32 query vector** (
 - Each **CUDA thread** handles one key index `k`.  
 - The thread loops over all groups belonging to that key (`num_groups_per_key = head_dim / 8`).  
 - For each group it:  
-  1. Loads the packed `uint32_t`.  
-  2. Loads the corresponding scale and zero.  
-  3. Unpacks the 8 nibbles.  
-  4. Converts them to floats, subtracts zero, multiplies by scale.  
-  5. Performs the dot product with the corresponding 8‑element slice of `query`.  
+  1. Computes the group‑major index `idx = g * num_keys + k`.  
+  2. Loads the packed `uint32_t`.  
+  3. Loads the corresponding scale and zero.  
+  4. Unpacks the 8 nibbles.  
+  5. Converts them to floats, multiplies by scale, adds zero.  
+  6. Performs the dot product with the corresponding 8‑element slice of `query`.  
 - The thread accumulates the total dot product in a register and writes it to `scores[k]`.
 
-This design ensures **coalesced memory access**: consecutive threads (with consecutive `k`) read consecutive `uint32_t` words from `q4_keys` (for the first group). The scales and zeros are also read in a coalesced manner. Since each thread processes many groups sequentially, the memory access pattern for the entire array is still coalesced across threads at any given loop iteration.
-
-For larger efficiency, each block can process multiple keys, but this simple version is fully functional and often sufficient if the number of keys is large (e.g., thousands).
+This design ensures **coalesced memory access**: for a given group `g`, consecutive threads (with consecutive `k`) read consecutive memory addresses. Because each thread loops over all groups sequentially, the entire array is accessed with perfect coalescing at every iteration.
 
 #### 4.1 Kernel Code
 
@@ -191,9 +199,11 @@ For larger efficiency, each block can process multiple keys, but this simple ver
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// Device function: unpack 8 nibbles from a packed 32-bit word.
+// Device function: unpack 8 nibbles from a packed 32-bit word and dequantize.
 // nibbles are stored in little-endian order: lowest nibble first.
-__device__ __forceinline__ void unpack8(uint32_t packed, float* vals, float scale, float zero) {
+__device__ __forceinline__ void unpack8_dequant(
+    uint32_t packed, float scale, float zero, float* vals)
+{
     // Extract low nibbles of each byte
     uint32_t low_mask = 0x0F0F0F0F;
     uint32_t low = packed & low_mask;          // each byte contains low nibble (0-15)
@@ -204,23 +214,23 @@ __device__ __forceinline__ void unpack8(uint32_t packed, float* vals, float scal
     uchar4 low_bytes  = *reinterpret_cast<uchar4*>(&low);
     uchar4 high_bytes = *reinterpret_cast<uchar4*>(&high);
 
-    // Convert to float, apply zero and scale
-    vals[0] = (float(low_bytes.x) - zero) * scale;
-    vals[1] = (float(high_bytes.x) - zero) * scale;
-    vals[2] = (float(low_bytes.y) - zero) * scale;
-    vals[3] = (float(high_bytes.y) - zero) * scale;
-    vals[4] = (float(low_bytes.z) - zero) * scale;
-    vals[5] = (float(high_bytes.z) - zero) * scale;
-    vals[6] = (float(low_bytes.w) - zero) * scale;
-    vals[7] = (float(high_bytes.w) - zero) * scale;
+    // Dequantize: value = nibble * scale + zero
+    vals[0] = float(low_bytes.x) * scale + zero;
+    vals[1] = float(high_bytes.x) * scale + zero;
+    vals[2] = float(low_bytes.y) * scale + zero;
+    vals[3] = float(high_bytes.y) * scale + zero;
+    vals[4] = float(low_bytes.z) * scale + zero;
+    vals[5] = float(high_bytes.z) * scale + zero;
+    vals[6] = float(low_bytes.w) * scale + zero;
+    vals[7] = float(high_bytes.w) * scale + zero;
 }
 
 // Kernel: compute dot product between a single query vector and all keys.
 // query: [head_dim] (FP32)
-// q4_keys: packed uint32 array, size num_keys * groups_per_key
-// scales, zeros: float arrays, same size as q4_keys
+// q4_keys: packed uint32 array, size num_keys * groups_per_key (group-major)
+// scales, zeros: float arrays, same indexing as q4_keys
 // scores: output, size num_keys
-// head_dim: dimension of query/key, must be multiple of 8
+// num_keys: number of keys
 // groups_per_key = head_dim / 8
 __global__ void q4_dot_product_kernel(
     const float* __restrict__ query,
@@ -234,20 +244,18 @@ __global__ void q4_dot_product_kernel(
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= num_keys) return;
 
-    // Base pointer for this key's groups
-    const uint32_t* key_packed = q4_keys + k * groups_per_key;
-    const float* key_scales = scales + k * groups_per_key;
-    const float* key_zeros = zeros + k * groups_per_key;
-
     float acc = 0.0f;
 
     for (int g = 0; g < groups_per_key; ++g) {
-        uint32_t packed = key_packed[g];
-        float scale = key_scales[g];
-        float zero = key_zeros[g];
+        // Group-major index: all keys' group g stored consecutively
+        int idx = g * num_keys + k;
+
+        uint32_t packed = q4_keys[idx];
+        float scale = scales[idx];
+        float zero = zeros[idx];
 
         float vals[8];
-        unpack8(packed, vals, scale, zero);
+        unpack8_dequant(packed, scale, zero, vals);
 
         // Query slice corresponding to this group
         const float* q = query + g * 8;
@@ -267,9 +275,16 @@ __global__ void q4_dot_product_kernel(
 To make the example self-contained, we provide a host function that quantises a FP32 key matrix into the grouped Q4 format using simple uniform quantisation per group.
 
 ```cpp
-// Utility: quantise a float array into grouped Q4.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>      // for fprintf
+#include <stdexcept>   // for std::invalid_argument
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// Utility: quantise a float array into grouped Q4 (group-major layout).
 // Input: keys [num_keys * head_dim] (row-major)
-// Output: q4_keys, scales, zeros allocated by caller.
+// Output: q4_keys, scales, zeros allocated by caller (size num_keys * groups_per_key)
 void quantize_q4_grouped(
     const float* keys,
     int num_keys,
@@ -282,28 +297,25 @@ void quantize_q4_grouped(
     for (int k = 0; k < num_keys; ++k) {
         for (int g = 0; g < groups_per_key; ++g) {
             const float* group_start = keys + (k * head_dim) + g * 8;
-            // Find min and max for this group
             float min_val = group_start[0], max_val = group_start[0];
             for (int i = 1; i < 8; ++i) {
-                min_val = fminf(min_val, group_start[i]);
-                max_val = fmaxf(max_val, group_start[i]);
+                min_val = std::fmin(min_val, group_start[i]);
+                max_val = std::fmax(max_val, group_start[i]);
             }
-            // Simple symmetric quantisation to range [0, 15]
             float range = max_val - min_val;
             if (range < 1e-6f) range = 1e-6f;
             float scale = range / 15.0f;
-            float zero = min_val; // we map min_val to 0
+            float zero = min_val;
 
-            // Pack nibbles
             uint32_t packed = 0;
             for (int i = 0; i < 8; ++i) {
                 float val = group_start[i];
-                int q = (int)roundf((val - zero) / scale);
-                q = max(0, min(15, q)); // clamp to 4-bit
-                // Place nibble i at bits [4*i, 4*i+3]
+                int q = (int)std::round((val - zero) / scale);
+                q = std::max(0, std::min(15, q));
                 packed |= (uint32_t)q << (4 * i);
             }
-            int idx = k * groups_per_key + g;
+
+            int idx = g * num_keys + k;
             q4_keys[idx] = packed;
             scales[idx] = scale;
             zeros[idx] = zero;
@@ -311,16 +323,19 @@ void quantize_q4_grouped(
     }
 }
 
-// Example launch
+// Example launch with error checking
 void compute_scores_q4(
     const float* query,        // [head_dim]
-    const uint32_t* q4_keys,   // packed
+    const uint32_t* q4_keys,   // packed, group-major
     const float* scales,
     const float* zeros,
     float* scores,             // [num_keys]
     int num_keys,
     int head_dim)
 {
+    if (head_dim % 8 != 0) {
+        throw std::invalid_argument("head_dim must be multiple of 8");
+    }
     int groups_per_key = head_dim / 8;
     int threads = 256;
     int blocks = (num_keys + threads - 1) / threads;
@@ -329,6 +344,17 @@ void compute_scores_q4(
         query, q4_keys, scales, zeros, scores,
         num_keys, groups_per_key
     );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel execution failed: %s\n", cudaGetErrorString(err));
+    }
 }
 ```
 
@@ -336,15 +362,15 @@ void compute_scores_q4(
 
 ### 5. Explanation and Functional Guarantees
 
-- **Unpacking function**: The `unpack8` device function uses bitwise operations to extract all eight 4‑bit nibbles from the 32‑bit word. It then applies the per‑group scale and zero to obtain FP32 values. The use of `uchar4` reinterpretation avoids explicit shifts for each nibble; the compiler will generate efficient byte‑extraction instructions.
+- **Unpacking and dequantization**: The `unpack8_dequant` device function uses bitwise operations to extract all eight 4‑bit nibbles from the 32‑bit word, then applies the per‑group scale and offset: `value = nibble * scale + zero`. This matches the quantization formula exactly (assuming no clamping artifacts; clamping only affects accuracy, not correctness).
 
-- **Memory coalescing**: The kernel accesses `q4_keys[g]`, `scales[g]`, `zeros[g]` for consecutive threads (`k` consecutive) at the same `g`. Therefore, the memory transactions are perfectly coalesced (32‑bit words).
+- **Memory coalescing**: Data is stored in group‑major order. For a fixed group index `g`, consecutive threads (with consecutive `k`) access consecutive memory addresses in `q4_keys`, `scales`, and `zeros`. Thus memory transactions are perfectly coalesced (32‑bit words).
 
 - **Arithmetic intensity**: The inner loop over 8 elements performs 8 FP32 fused multiply‑adds per group. The unpacking overhead (about 6–8 integer instructions) is amortised over 8 FMAs. For typical head dimensions (e.g., 128 → 16 groups), the kernel is **memory‑bound** on the packed data, not compute‑bound.
 
-- **Correctness**: The kernel assumes `head_dim` is a multiple of 8. If not, padding is required. The quantisation function clamps values to [0,15], and zero is set to the group minimum so that values are non‑negative, which is standard for unsigned 4‑bit quantisation. The dequantisation formula matches: `(nibble - zero) * scale = (nibble * scale) - zero*scale`. Because zero is a float, the subtraction happens after scaling in the kernel, but mathematically equivalent.
+- **Correctness**: The kernel assumes `head_dim` is a multiple of 8. If not, padding is required. The quantisation function clamps values to [0,15], and the offset is set to the group minimum so that dequantized values are non‑negative, which is standard for unsigned 4‑bit quantisation. The dequantisation formula matches the quantization scheme, ensuring accurate reconstruction within rounding error.
 
-- **Performance expectation**: On a Pascal GPU (e.g., GTX 1080 Ti), this kernel should achieve a large fraction of peak memory bandwidth. For a 24k context with head_dim=128, the Q4 data size per key is 64 bytes (128/8*4). Processing 24k keys requires reading ~1.5 MB of Q4 data, plus scales/zeros (3 MB). That is negligible compared to the 384 MB needed for FP32. The kernel will likely run in **milliseconds**, not minutes.
+- **Performance expectation**: With the corrected coalesced layout and correct dequantization, the kernel should achieve a large fraction of peak memory bandwidth. The memory traffic per key is `(packed word + scale + zero) = 4 + 4 + 4 = 12 bytes` per group. For `head_dim = 128`, that's `16 × 12 = 192 bytes` per key. For 24k keys, ~4.7 MB total, which can be read in ~10 microseconds at peak bandwidth on a GTX 1080 Ti. Kernel launch overhead dominates, making overall runtime in the tens of microseconds to low milliseconds.
 
 ---
 
@@ -374,7 +400,7 @@ For use in an actual LLM inference engine, the Q4 KV cache must be stored persis
 
 ### 8. Conclusion
 
-Grouped Q4 quantisation with sets of 8 values per 32‑bit word provides a practical solution for Pascal GPUs: it reduces memory footprint by 8× while keeping dequantization overhead low enough to remain memory‑bound. The provided kernel demonstrates a fully functional implementation that should drastically outperform naive Q4 approaches and approach FP32 speeds in memory‑bound attention workloads. The key is to **avoid scalar per‑element unpacking** and **ensure coalesced 32‑bit memory accesses**. the gains come from careful data layout and efficient CUDA programming.
+Grouped Q4 quantisation with sets of 8 values per 32‑bit word provides a practical solution for Pascal GPUs: it reduces memory footprint (8× for the packed values, ~2.7× including metadata) while keeping dequantization overhead low enough to remain memory‑bound. The provided kernel demonstrates a fully functional implementation with correct dequantization and coalesced memory access, which should drastically outperform naive Q4 approaches and approach FP32 speeds in memory‑bound attention workloads. The key is to **avoid scalar per‑element unpacking**, **ensure coalesced 32‑bit memory accesses** via a group‑major layout, and **use the correct dequantization formula**.
 
 ---
 
